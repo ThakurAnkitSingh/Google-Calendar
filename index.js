@@ -1,112 +1,181 @@
-// First, create a project on Google Cloud and setup the credentials and google consent thing.
-//  After that, the value of API_KEY, CLIENT_ID, REDIRECT_URL, and CLIENT_SECRET, these all secrets you will keep in .env file
-
-
-
-
 import dotenv from 'dotenv';
-
-dotenv.config({});
-
 import express from 'express';
 import { google } from 'googleapis';
 import dayjs from 'dayjs';
 import { v4 as uuid } from 'uuid';
 
+// Load environment variables
+dotenv.config();
 
 const app = express();
+app.use(express.json()); // Add JSON body parser
 
-const PORT = process.env.NODE_ENV || 8000
+const PORT = process.env.PORT || 8000;
 
+// Initialize Google Calendar API
 const calendar = google.calendar({
     version: "v3",
     auth: process.env.API_KEY
-})
+});
+
+// Setup OAuth2 client
 const oauth2Client = new google.auth.OAuth2(
-    // Auth setup for us
     process.env.CLIENT_ID,
     process.env.CLIENT_SECRET,
     process.env.REDIRECT_URL
-)
-
+);
 
 const scopes = [
-    'https://www.googleapis.com/auth/calendar'
-]
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/calendar.events'
+];
 
+// Store tokens temporarily (in production, use a database)
+const tokens = new Map();
 
+// Initialize OAuth flow
 app.get('/rest/v1/calendar/init/', (req, res) => {
-    // If user want to  redirect the user to another place an dwe have created the google project on google cloud and set the credientials and addind scope and etc.
-    const url = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        scope: scopes,
-        // include_granted_scopes: true
-        // we are generating URL and we are getting the permission from google 
-    })
-    // we will redirecting the user to this url
-    res.redirect(url);
-})
+    try {
+        const url = oauth2Client.generateAuthUrl({
+            access_type: 'offline',
+            scope: scopes,
+            prompt: 'consent'
+        });
+        res.redirect(url);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to initialize OAuth flow' });
+    }
+});
 
+// Handle OAuth callback
 app.get('/rest/v1/calendar/redirect/', async (req, res) => {
-    // URL header have our token
-    const code = req.query.code; // user token
+    try {
+        const { code } = req.query;
+        const { tokens: userTokens } = await oauth2Client.getToken(code);
+        oauth2Client.setCredentials(userTokens);
+        tokens.set('user', userTokens); // Store tokens (use proper storage in production)
+        
+        res.json({
+            success: true,
+            message: "Successfully authenticated"
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Authentication failed' });
+    }
+});
 
-    // This will provide an object with the access_token and refresh_token.
-    // Save these somewhere safe so they can be used at a later time.
-    const { tokens } = await oauth2Client.getToken(code)
-    oauth2Client.setCredentials(tokens);
-    // we done the client credentials
+// Get list of upcoming events
+app.get('/events', async (req, res) => {
+    try {
+        const response = await calendar.events.list({
+            auth: oauth2Client,
+            calendarId: 'primary',
+            timeMin: (new Date()).toISOString(),
+            maxResults: 10,
+            singleEvents: true,
+            orderBy: 'startTime',
+        });
+        res.json(response.data.items);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch events' });
+    }
+});
 
+// Schedule a new event
+app.post('/schedule_event', async (req, res) => {
+    try {
+        const {
+            summary = 'New Meeting',
+            description = '',
+            startTime = dayjs().add(1, 'day'),
+            duration = 60,
+            attendees = [],
+            timeZone = 'Asia/Kolkata'
+        } = req.body;
 
-    res.send({
-        msg: "YOu have successfully logged in"
-    });
-})
-
-
-// Bonus Feature for scheduling an event and google meet
-
-app.get('/schedule_event', async (req, res) => {
-    // we are inserting the events and setting up all the events, time, summary about the events
-    await calendar.events.insert({
-        calendarId: 'primary',
-        auth: oauth2Client,
-        requestBody: {
-            summary: 'This is a schedule event',
-            description: 'This is a interview meeting',
-            start: {
-                // daysjs module for date
-                dateTime: dayjs(new Date()).add(1, 'day').toISOString(),
-                timeZone: 'Asia/Kolkata'
-            },
-            end: {
-                dateTime: dayjs(new Date()).add(1, 'day').add(1, 'hour').toISOString(),
-                timeZone: 'Asia/Kolkata'
-            },
-            // for google meet
-            conferenceData: {
-                createRequest: {
-                    requestId: uuid(),
-                }
-            },
-            attendees: [
-                {
-                    // email: 'There will be a client email or gmail id',
+        const event = await calendar.events.insert({
+            auth: oauth2Client,
+            calendarId: 'primary',
+            requestBody: {
+                summary,
+                description,
+                start: {
+                    dateTime: dayjs(startTime).toISOString(),
+                    timeZone
                 },
-            ]
-        }
-    });
+                end: {
+                    dateTime: dayjs(startTime).add(duration, 'minute').toISOString(),
+                    timeZone
+                },
+                conferenceData: {
+                    createRequest: {
+                        requestId: uuid(),
+                        conferenceSolutionKey: { type: 'hangoutsMeet' }
+                    }
+                },
+                attendees: attendees.map(email => ({ email })),
+                reminders: {
+                    useDefault: false,
+                    overrides: [
+                        { method: 'email', minutes: 24 * 60 },
+                        { method: 'popup', minutes: 30 }
+                    ]
+                },
+                guestsCanModify: true,
+                guestsCanInviteOthers: true
+            },
+            conferenceDataVersion: 1
+        });
 
-    res.send({
-        msg: "Done!"
-    })
-})
+        res.json({
+            success: true,
+            eventId: event.data.id,
+            meetLink: event.data.conferenceData?.entryPoints?.[0]?.uri,
+            htmlLink: event.data.htmlLink
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            error: 'Failed to schedule event',
+            details: error.message 
+        });
+    }
+});
 
+// Delete an event
+app.delete('/events/:eventId', async (req, res) => {
+    try {
+        await calendar.events.delete({
+            auth: oauth2Client,
+            calendarId: 'primary',
+            eventId: req.params.eventId
+        });
+        res.json({ success: true, message: 'Event deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to delete event' });
+    }
+});
 
+// Update an event
+app.patch('/events/:eventId', async (req, res) => {
+    try {
+        const event = await calendar.events.patch({
+            auth: oauth2Client,
+            calendarId: 'primary',
+            eventId: req.params.eventId,
+            requestBody: req.body
+        });
+        res.json(event.data);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to update event' });
+    }
+});
 
-
-
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({ error: 'Something went wrong!' });
+});
 
 app.listen(PORT, () => {
-    console.log("Server started on port", PORT)
-})
+    console.log(`Server running on port ${PORT}`);
+});
